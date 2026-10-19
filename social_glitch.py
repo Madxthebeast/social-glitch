@@ -73,28 +73,7 @@ ERROR_MESSAGES = {
     "SESSION_EXPIRED": "Your session has expired. Please log in again.",
     "ACCOUNT_TEMP_LOCKED": "Too many failed attempts. Try again in 5 minutes.",
 }
-DEFAULT_ERROR = "Something went wrong.\nPlease try again."
-
-@dataclass
-class Result:
-    ok: bool
-    data: Any = None
-    error: str = ""
-    @property
-    def message(self):
-        return ERROR_MESSAGES.get(self.error, DEFAULT_ERROR)
-class BackendInterface:
-    def __init__(self, transport=None):
-
-        self._transport = transport
-        self._token = None
-
-    def _tcp(self, action, params):
-        req = {"action": action, "token": self._token, "params": params}
-        with socket.create_connection((BACKEND_HOST, BACKEND_PORT), BACKEND_TIMEOUT) as s:
-            s.sendall((json.dumps(req) + "\n").encode())
-            buf = b""
-            while not buf.endswith(b"\n") and len(buf) < 4_000_000:
+DEFAULT_ERROR = "Something went wrong.\nPlease try again."_000:
                 chunk = s.recv(4096)
                 if not chunk:
                     break
