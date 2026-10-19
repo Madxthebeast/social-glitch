@@ -1,0 +1,858 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <ctype.h>
+#include <stdint.h>
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    typedef SOCKET socket_t;
+    #define CLOSESOCK closesocket
+    #define SOCKERR WSAGetLastError()
+#else
+    #include <sys/types.h>
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    typedef int socket_t;
+    #define INVALID_SOCKET (-1)
+    #define SOCKET_ERROR (-1)
+    #define CLOSESOCK close
+#endif
+#define PORT 5050
+#define DB_FILE "social_glitch.db"
+#define MAX_USERS 256
+#define MAX_POSTS 1024
+#define MAX_REL 2048
+#define MAX_MSG 4096
+#define MAX_NOTE 4096
+#define MAX_REPORT 1024
+#define MAX_INVITE 1024
+#define MAX_LOG 4096
+#define MAX_SESSION 256
+#define NAME_LEN 80
+#define USER_LEN 32
+#define PASS_LEN 128
+#define TEXT_LEN 600
+#define TOKEN_LEN 80
+#define REQ_LEN 8192
+#define RESP_LEN 65536
+
+typedef struct {
+    int id;
+    char sg_id[24];
+    char name[NAME_LEN];
+    char username[USER_LEN];
+    char password[PASS_LEN];
+    char email[128];
+    char recovery_question[160];
+    char recovery_answer[160];
+    char role[16];
+    int enabled;
+    int failed;
+    time_t lock_until;
+    char visibility[16];
+    char profile_view[24];
+    char friend_requests[24];
+    char messages[16];
+} User;
+typedef struct {
+
+    int id, author, visibility;
+    time_t t;
+    char text[TEXT_LEN];
+    int likes[MAX_USERS];
+    int like_count;
+    int comment_ids[MAX_REL];
+    int comment_count;
+} Post;
+
+typedef struct {
+    int id, from, to, status;
+} Request;
+typedef struct {
+    int a, b;
+} Pair;
+
+typedef struct {
+    int id, author, post_id;
+    time_t t;
+    char text[TEXT_LEN];
+} Comment;
+typedef struct {
+    int id, from, to;
+    time_t t;
+    int read;
+    char text[TEXT_LEN];
+} Message;
+
+typedef struct {
+    int id, uid, type, read;
+    time_t t;
+    char text[TEXT_LEN];
+} Notification;
+typedef struct {
+    char id[32];
+    int from, to, status;
+    time_t expires;
+    char payload[128];
+} Invite;
+typedef struct {
+    char id[32];
+    int reporter;
+    char target_type[16];
+    char target_id[64];
+    char reason[128];
+    char description[TEXT_LEN];
+    char status[16];
+    time_t t;
+} Report;
+
+typedef struct {
+    int uid;
+    time_t t;
+    char text[TEXT_LEN];
+    char level[16];
+} LogEntry;
+typedef struct {
+    char token[TOKEN_LEN];
+    int uid;
+    time_t expires;
+} Session;
+
+static User users[MAX_USERS]; static int nusers = 0;
+static Post posts[MAX_POSTS]; static int nposts = 0;
+static Request requests[MAX_REL]; static int nrequests = 0;
+static Pair friends_rel[MAX_REL]; static int nfriends = 0;
+static Pair blocks_rel[MAX_REL]; static int nblocks = 0;
+static Comment comments[MAX_REL]; static int ncomments = 0;
+static Message messages[MAX_MSG]; static int nmessages = 0;
+static Notification notes[MAX_NOTE]; static int nnotes = 0;
+static Invite invites[MAX_INVITE]; static int ninvites = 0;
+static Report reports[MAX_REPORT]; static int nreports = 0;
+static LogEntry logs[MAX_LOG]; static int nlogs = 0;
+static Session sessions[MAX_SESSION]; static int nsessions = 0;
+typedef struct {
+    int uid;
+    char code[8];
+    time_t expires;
+    int attempts;
+} RecoveryCode;
+static RecoveryCode recovery_codes[MAX_SESSION];
+static int nrecovery = 0;
+
+static int next_id = 1000;
+
+static void safe_copy(char *d, size_t n, const char *s) {
+    if (!s) s = "";
+    if (n == 0) return;
+    strncpy(d, s, n - 1);
+    d[n - 1] = '\0';
+}
+static void json_escape(const char *src, char *dst, size_t n) {
+    size_t j = 0;
+    if (!src) src = "";
+    for (size_t i = 0; src[i] && j + 2 < n; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') { dst[j++]='\\'; dst[j++]=(char)c; }
+        else if (c == '\n') { dst[j++]='\\'; dst[j++]='n'; }
+        else if (c == '\r') { dst[j++]='\\'; dst[j++]='r'; }
+        else if (c == '\t') { dst[j++]='\\'; dst[j++]='t'; }
+        else if (c >= 32) dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
+static void out_begin(char *o, size_t n, const char *data) {
+    snprintf(o, n, "{\"ok\":true,\"data\":%s}", data ? data : "{}");
+}
+static void out_error(char *o, size_t n, const char *e) {
+    char x[256]; json_escape(e, x, sizeof(x));
+    snprintf(o, n, "{\"ok\":false,\"error\":\"%s\"}", x);
+}
+static const char *jstr(const char *json, const char *key, char *out, size_t cap) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return NULL;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return NULL;
+    p++;
+    size_t j=0;
+    while (*p && *p != '"' && j+1<cap) {
+        if (*p=='\\' && p[1]) {
+            p++;
+            if (*p=='n') out[j++]='\n';
+            else if (*p=='r') out[j++]='\r';
+            else if (*p=='t') out[j++]='\t';
+            else out[j++]=*p;
+        } else out[j++]=*p;
+        p++;
+    }
+    out[j]='\0';
+    return out;
+}
+
+static int jint(const char *json, const char *key, int def) {
+    char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
+    const char *p=strstr(json,pat); if(!p) return def;
+    p=strchr(p+strlen(pat),':'); if(!p) return def; p++;
+    while(*p && isspace((unsigned char)*p)) p++;
+    return atoi(p);
+}
+
+static int jbool(const char *json, const char *key, int def) {
+    char pat[128]; snprintf(pat,sizeof(pat),"\"%s\"",key);
+    const char *p=strstr(json,pat); if(!p) return def;
+    p=strchr(p+strlen(pat),':'); if(!p) return def; p++;
+    while(*p && isspace((unsigned char)*p)) p++;
+    if (!strncmp(p,"true",4)) return 1;
+    if (!strncmp(p,"false",5)) return 0;
+    return def;
+}
+
+static int uid_by_sgid(const char *sg) {
+    for(int i=0;i<nusers;i++) if(!strcasecmp(users[i].sg_id,sg)) return users[i].id;
+    return 0;
+}
+static int user_index(int id) {
+    for(int i=0;i<nusers;i++) if(users[i].id==id) return i;
+    return -1;
+}
+static User *user_ptr(int id) {
+    int i=user_index(id); return i>=0 ? &users[i] : NULL;
+}
+static int username_exists(const char *u, int except) {
+    for(int i=0;i<nusers;i++)
+        if(users[i].id!=except && !strcasecmp(users[i].username,u)) return 1;
+    return 0;
+}
+static int are_friends(int a,int b) {
+    for(int i=0;i<nfriends;i++)
+        if((friends_rel[i].a==a&&friends_rel[i].b==b)||(friends_rel[i].a==b&&friends_rel[i].b==a)) return 1;
+    return 0;
+}
+static int is_blocked(int a,int b) {
+    for(int i=0;i<nblocks;i++) if(blocks_rel[i].a==a&&blocks_rel[i].b==b) return 1;
+    for(int i=0;i<nblocks;i++) if(blocks_rel[i].a==b&&blocks_rel[i].b==a) return 1;
+    return 0;
+}
+static void add_friend(int a,int b) {
+    if(!are_friends(a,b) && nfriends<MAX_REL) {
+        friends_rel[nfriends].a=a; friends_rel[nfriends].b=b; nfriends++;
+    }
+}
+static void remove_friend(int a,int b) {
+    for(int i=0;i<nfriends;i++) if((friends_rel[i].a==a&&friends_rel[i].b==b)||(friends_rel[i].a==b&&friends_rel[i].b==a)) {
+        friends_rel[i]=friends_rel[--nfriends]; i--;
+    }
+}
+static int friend_count(int id) {
+    int n=0; for(int i=0;i<nfriends;i++) if(friends_rel[i].a==id||friends_rel[i].b==id)n++; return n;
+}
+static int post_visible(Post *p,int me) {
+    if(p->author==me) return 1;
+    if(is_blocked(me,p->author)) return 0;
+    if(p->visibility==0) return 1;
+    if(p->visibility==1) return are_friends(me,p->author);
+    return 0;
+}
+static void log_event(int uid,const char *text,const char *level) {
+    if(nlogs>=MAX_LOG) return;
+    logs[nlogs].uid=uid; logs[nlogs].t=time(NULL);
+    safe_copy(logs[nlogs].text,TEXT_LEN,text);
+    safe_copy(logs[nlogs].level,sizeof(logs[nlogs].level),level?level:"info");
+    nlogs++;
+}
+static void notify_user(int uid,const char *text,int type) {
+    if(nnotes>=MAX_NOTE) return;
+    notes[nnotes].id=next_id++; notes[nnotes].uid=uid; notes[nnotes].type=type;
+    notes[nnotes].read=0; notes[nnotes].t=time(NULL);
+    safe_copy(notes[nnotes].text,TEXT_LEN,text); nnotes++;
+}
+static void public_user_json(char *o,size_t n,int id) {
+    User *u=user_ptr(id);
+    if(!u){snprintf(o,n,"{}");return;}
+    char name[160]; json_escape(u->name,name,sizeof(name));
+    char un[80]; json_escape(u->username,un,sizeof(un));
+    snprintf(o,n,"{\"id\":%d,\"sg_id\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"role\":\"%s\"}",
+        u->id,u->sg_id,name,un,u->role);
+}
+
+static void make_token(char *t,size_t n,int uid) {
+    snprintf(t,n,"SG_%d_%llu_%d",(int)time(NULL),(unsigned long long)(uintptr_t)t,uid);
+}
+static int session_uid(const char *token) {
+    if(!token || !*token) return 0;
+    time_t now=time(NULL);
+    for(int i=0;i<nsessions;i++)
+        if(!strcmp(sessions[i].token,token)) {
+            if(sessions[i].expires<now) { sessions[i]=sessions[--nsessions]; return 0; }
+            return sessions[i].uid;
+        }
+    return 0;
+}
+
+typedef struct {
+    int magic;
+    int nu,np,nr,nf,nb,nc,nm,nn,ni,nrep,nlog,next;
+} Header;
+
+static void save_db(void) {
+    FILE *f=fopen(DB_FILE,"wb"); if(!f)return;
+    Header h={0x53474732,nusers,nposts,nrequests,nfriends,nblocks,ncomments,nmessages,nnotes,ninvites,nreports,nlogs,next_id};
+    fwrite(&h,sizeof(h),1,f);
+    fwrite(users,sizeof(User),nusers,f);
+    fwrite(posts,sizeof(Post),nposts,f);
+    fwrite(requests,sizeof(Request),nrequests,f);
+    fwrite(friends_rel,sizeof(Pair),nfriends,f);
+    fwrite(blocks_rel,sizeof(Pair),nblocks,f);
+    fwrite(comments,sizeof(Comment),ncomments,f);
+    fwrite(messages,sizeof(Message),nmessages,f);
+    fwrite(notes,sizeof(Notification),nnotes,f);
+    fwrite(invites,sizeof(Invite),ninvites,f);
+    fwrite(reports,sizeof(Report),nreports,f);
+    fwrite(logs,sizeof(LogEntry),nlogs,f);
+    fclose(f);
+}
+static int load_db(void) {
+    FILE *f=fopen(DB_FILE,"rb"); if(!f)return 0;
+    Header h; if(fread(&h,sizeof(h),1,f)!=1 || h.magic!=0x53474732){fclose(f);return 0;}
+    nusers=h.nu;nposts=h.np;nrequests=h.nr;nfriends=h.nf;nblocks=h.nb;ncomments=h.nc;
+    nmessages=h.nm;nnotes=h.nn;ninvites=h.ni;nreports=h.nrep;nlogs=h.nlog;next_id=h.next;
+    fread(users,sizeof(User),nusers,f); fread(posts,sizeof(Post),nposts,f);
+    fread(requests,sizeof(Request),nrequests,f); fread(friends_rel,sizeof(Pair),nfriends,f);
+    fread(blocks_rel,sizeof(Pair),nblocks,f); fread(comments,sizeof(Comment),ncomments,f);
+    fread(messages,sizeof(Message),nmessages,f); fread(notes,sizeof(Notification),nnotes,f);
+    fread(invites,sizeof(Invite),ninvites,f); fread(reports,sizeof(Report),nreports,f);
+    fread(logs,sizeof(LogEntry),nlogs,f); fclose(f); return 1;
+}
+static void seed(void) {
+    if(load_db()) return;
+    memset(users,0,sizeof(users));
+    User a={0},ad={0};
+    a.id=1; snprintf(a.sg_id,sizeof(a.sg_id),"SG-000001"); safe_copy(a.name,NAME_LEN,"Demo User");
+    safe_copy(a.username,USER_LEN,"demo"); safe_copy(a.password,PASS_LEN,"Demo@1234"); safe_copy(a.email,sizeof(a.email),"testcase200722@gmail.com"); safe_copy(a.recovery_question,sizeof(a.recovery_question),"What was the name of your first school?"); safe_copy(a.recovery_answer,sizeof(a.recovery_answer),"demo"); safe_copy(a.role,16,"user");
+    a.enabled=1; safe_copy(a.visibility,16,"public"); safe_copy(a.profile_view,24,"everyone");
+    safe_copy(a.friend_requests,24,"everyone"); safe_copy(a.messages,16,"friends");
+    ad.id=2; snprintf(ad.sg_id,sizeof(ad.sg_id),"SG-000002"); safe_copy(ad.name,NAME_LEN,"System Admin");
+    safe_copy(ad.username,USER_LEN,"admin"); safe_copy(ad.password,PASS_LEN,"Admin@1234");
+    safe_copy(ad.email,sizeof(ad.email),"admin@example.com");
+    safe_copy(ad.recovery_question,sizeof(ad.recovery_question),"What is your favorite childhood nickname?");
+    safe_copy(ad.recovery_answer,sizeof(ad.recovery_answer),"admin");
+    safe_copy(ad.role,16,"admin");
+    ad.enabled=1; safe_copy(ad.visibility,16,"public"); safe_copy(ad.profile_view,24,"everyone");
+    safe_copy(ad.friend_requests,24,"everyone"); safe_copy(ad.messages,16,"everyone");
+    users[0]=a;users[1]=ad;nusers=2;next_id=1000;
+    add_friend(1,2);
+    log_event(1,"Demo account initialized","security");
+    log_event(2,"Admin account initialized","security");
+    save_db();
+}
+static int strong_password(const char *p) {
+    int lower=0, upper=0, digit=0, special=0; size_t n=strlen(p);
+    if(n<10) return 0;
+    for(size_t i=0;i<n;i++){ unsigned char c=(unsigned char)p[i];
+        if(islower(c)) lower=1; else if(isupper(c)) upper=1; else if(isdigit(c)) digit=1; else if(!isspace(c)) special=1; }
+    return lower&&upper&&digit&&special;
+}
+
+static void dispatch(const char *req,char *out,size_t outn) {
+    char action[80]={0}, token[TOKEN_LEN]={0};
+    jstr(req,"action",action,sizeof(action));
+    jstr(req,"token",token,sizeof(token));
+    int uid=session_uid(token);
+    int public_action=!strcmp(action,"ping")||!strcmp(action,"auth.login")||!strcmp(action,"auth.register")||!strcmp(action,"auth.recovery_question")||!strcmp(action,"auth.reset_security")||!strcmp(action,"auth.send_code")||!strcmp(action,"auth.reset_email");
+    if(!public_action && !uid){out_error(out,outn,"AUTH_REQUIRED");return;}
+    User *me=user_ptr(uid);
+
+    if(!strcmp(action,"ping")) {
+        out_begin(out,outn,"{\"mode\":\"c\",\"port\":5050}"); return;
+    }
+
+    if(!strcmp(action,"auth.register")) {
+        char name[NAME_LEN],un[USER_LEN],pw[PASS_LEN],email[128],question[160],answer[160];
+        jstr(req,"name",name,sizeof(name)); jstr(req,"username",un,sizeof(un)); jstr(req,"password",pw,sizeof(pw));
+        jstr(req,"email",email,sizeof(email)); jstr(req,"question",question,sizeof(question)); jstr(req,"answer",answer,sizeof(answer));
+        if(!name[0]||!un[0]||!email[0]||!question[0]||!answer[0]){out_error(out,outn,"INVALID_INPUT");return;}
+        if(!strong_password(pw)){out_error(out,outn,"WEAK_PASSWORD");return;}
+        if(!strchr(email,'@')){out_error(out,outn,"INVALID_INPUT");return;}
+        if(username_exists(un,0)){out_error(out,outn,"USERNAME_TAKEN");return;}
+        if(nusers>=MAX_USERS){out_error(out,outn,"SERVER_FULL");return;}
+        User *u=&users[nusers]; memset(u,0,sizeof(*u)); u->id=next_id++;
+        snprintf(u->sg_id,sizeof(u->sg_id),"SG-%06d",u->id);
+        safe_copy(u->name,NAME_LEN,name);safe_copy(u->username,USER_LEN,un);safe_copy(u->password,PASS_LEN,pw);
+        safe_copy(u->email,sizeof(u->email),email);safe_copy(u->recovery_question,sizeof(u->recovery_question),question);
+        safe_copy(u->recovery_answer,sizeof(u->recovery_answer),answer);
+        safe_copy(u->role,16,"user");u->enabled=1;
+        safe_copy(u->visibility,16,"private");safe_copy(u->profile_view,24,"friends");
+        safe_copy(u->friend_requests,24,"everyone");safe_copy(u->messages,16,"friends");
+        nusers++; log_event(u->id,"Account created","security"); save_db();
+        char d[256];snprintf(d,sizeof(d),"{\"sg_id\":\"%s\"}",u->sg_id);out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"auth.login")) {
+        char un[USER_LEN],pw[PASS_LEN];jstr(req,"username",un,sizeof(un));jstr(req,"password",pw,sizeof(pw));
+        User *u=NULL;for(int i=0;i<nusers;i++)if(!strcasecmp(users[i].username,un)){u=&users[i];break;}
+        if(u && u->lock_until > time(NULL)){out_error(out,outn,"ACCOUNT_TEMP_LOCKED");return;}
+        if(!u||strcmp(u->password,pw)){if(u){u->failed++; if(u->failed>=5){u->lock_until=time(NULL)+300; log_event(u->id,"Account temporarily locked after repeated failures","warning");} else log_event(u->id,"Failed login attempt","warning"); save_db();}out_error(out,outn,"INVALID_CREDENTIALS");return;}
+        if(!u->enabled){out_error(out,outn,"ACCOUNT_DISABLED");return;}
+        u->failed=0; u->lock_until=0;
+        if(nsessions<MAX_SESSION){make_token(sessions[nsessions].token,sizeof(sessions[nsessions].token),u->id);
+            sessions[nsessions].uid=u->id;sessions[nsessions].expires=time(NULL)+86400*2;nsessions++;}
+        else {out_error(out,outn,"SERVER_FULL");return;}
+        log_event(u->id,"Successful login","security");save_db();
+        char pj[512];public_user_json(pj,sizeof(pj),u->id);
+        char d[1024];snprintf(d,sizeof(d),"{\"token\":\"%s\",\"user\":%s}",sessions[nsessions-1].token,pj);
+        out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"auth.recovery_question")) {
+        char un[USER_LEN]; jstr(req,"username",un,sizeof(un));
+        User *u=NULL;
+        for(int i=0;i<nusers;i++) if(!strcasecmp(users[i].username,un)){u=&users[i];break;}
+        if(!u){out_error(out,outn,"USER_NOT_FOUND");return;}
+        char q[400];json_escape(u->recovery_question,q,sizeof(q));
+        char d[512];snprintf(d,sizeof(d),"{\"question\":\"%s\"}",q);
+        out_begin(out,outn,d);return;
+    }
+
+    if(!strcmp(action,"auth.reset_security")) {
+        char un[USER_LEN],answer[160],newp[PASS_LEN];
+        jstr(req,"username",un,sizeof(un));jstr(req,"answer",answer,sizeof(answer));jstr(req,"new_password",newp,sizeof(newp));
+        User *u=NULL;
+        for(int i=0;i<nusers;i++) if(!strcasecmp(users[i].username,un)){u=&users[i];break;}
+        if(!u){out_error(out,outn,"USER_NOT_FOUND");return;}
+        if(strcasecmp(u->recovery_answer,answer)!=0){out_error(out,outn,"WRONG_ANSWER");return;}
+        if(!strong_password(newp)){out_error(out,outn,"WEAK_PASSWORD");return;}
+        safe_copy(u->password,PASS_LEN,newp);
+        log_event(u->id,"Password reset using security question","security");
+        save_db();
+        out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"auth.send_code")) {
+        char un[USER_LEN];jstr(req,"username",un,sizeof(un));
+        User *u=NULL;
+        for(int i=0;i<nusers;i++) if(!strcasecmp(users[i].username,un)){u=&users[i];break;}
+        if(!u){out_error(out,outn,"USER_NOT_FOUND");return;}
+        if(!u->email[0] || !strchr(u->email,'@')){out_error(out,outn,"EMAIL_NOT_CONFIGURED");return;}
+
+        int code=(int)(100000 + (rand()%900000));
+        int idx=-1;
+        for(int i=0;i<nrecovery;i++)if(recovery_codes[i].uid==u->id){idx=i;break;}
+        if(idx<0){if(nrecovery>=MAX_SESSION){out_error(out,outn,"SERVER_FULL");return;}idx=nrecovery++;}
+        recovery_codes[idx].uid=u->id;
+        snprintf(recovery_codes[idx].code,sizeof(recovery_codes[idx].code),"%06d",code);
+        recovery_codes[idx].expires=time(NULL)+600; recovery_codes[idx].attempts=0;
+        char cmd[700];
+#ifdef _WIN32
+        snprintf(cmd,sizeof(cmd),"python email_sender.py \"%s\" \"%s\" \"%s\"",u->email,recovery_codes[idx].code,u->name);
+#else
+        snprintf(cmd,sizeof(cmd),"python3 email_sender.py \"%s\" \"%s\" \"%s\"",u->email,recovery_codes[idx].code,u->name);
+#endif
+        int rc=system(cmd);
+        if(rc!=0){out_error(out,outn,"EMAIL_SEND_FAILED");return;}
+        log_event(u->id,"Password recovery code sent by email","security");
+        out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"auth.reset_email")) {
+        char un[USER_LEN],code[16],newp[PASS_LEN];
+        jstr(req,"username",un,sizeof(un));jstr(req,"code",code,sizeof(code));jstr(req,"new_password",newp,sizeof(newp));
+        User *u=NULL;
+        for(int i=0;i<nusers;i++)if(!strcasecmp(users[i].username,un)){u=&users[i];break;}
+        if(!u){out_error(out,outn,"USER_NOT_FOUND");return;}
+        int valid=0;
+        for(int i=0;i<nrecovery;i++) if(recovery_codes[i].uid==u->id){
+            if(recovery_codes[i].expires<time(NULL) || recovery_codes[i].attempts>=5) break;
+            if(!strcmp(recovery_codes[i].code,code)){valid=1;recovery_codes[i].code[0]='\0';break;}
+            recovery_codes[i].attempts++; if(recovery_codes[i].attempts>=5) recovery_codes[i].expires=time(NULL);
+            break;
+        }
+        if(!valid){out_error(out,outn,"INVALID_CODE");return;}
+        if(!strong_password(newp)){out_error(out,outn,"WEAK_PASSWORD");return;}
+        safe_copy(u->password,PASS_LEN,newp);
+        log_event(u->id,"Password reset using email code","security");
+        save_db();
+        out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"auth.logout")) {
+        for(int i=0;i<nsessions;i++)if(!strcmp(sessions[i].token,token)){sessions[i]=sessions[--nsessions];break;}
+        out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"auth.change_password")) {
+        char oldp[PASS_LEN],newp[PASS_LEN];jstr(req,"old",oldp,sizeof(oldp));jstr(req,"new",newp,sizeof(newp));
+        if(strcmp(me->password,oldp)){out_error(out,outn,"INVALID_CREDENTIALS");return;}
+        if(!strong_password(newp)){out_error(out,outn,"WEAK_PASSWORD");return;}
+        safe_copy(me->password,PASS_LEN,newp);log_event(uid,"Password changed","security");save_db();
+        out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"dashboard.get")) {
+        int unread=0,nn=0;
+        for(int i=0;i<nmessages;i++)if(messages[i].to==uid&&!messages[i].read)unread++;
+        for(int i=0;i<nnotes;i++)if(notes[i].uid==uid&&!notes[i].read)nn++;
+        char d[RESP_LEN];snprintf(d,sizeof(d),"{\"friends\":%d,\"unread_messages\":%d,\"notifications\":%d,\"account\":\"%s\",\"security_status\":\"PROTECTED\",\"recent_activity\":[]}",
+            friend_count(uid),unread,nn,!strcmp(me->visibility,"public")?"PUBLIC":"PRIVATE");
+        out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"profile.get")) {
+        int id=jint(req,"user_id",uid);User *u=user_ptr(id);if(!u){out_error(out,outn,"USER_NOT_FOUND");return;}
+        char nm[160],un[80];json_escape(u->name,nm,sizeof(nm));json_escape(u->username,un,sizeof(un));
+        int pc=0;for(int i=0;i<nposts;i++)if(posts[i].author==id)pc++;
+        char d[1024];snprintf(d,sizeof(d),"{\"id\":%d,\"sg_id\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"role\":\"%s\",\"account_type\":\"%s\",\"friends\":%d,\"posts\":%d}",
+            id,u->sg_id,nm,un,u->role,!strcmp(u->visibility,"public")?"PUBLIC":"PRIVATE",friend_count(id),pc);
+        out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"profile.update_name")) {
+        char v[NAME_LEN];jstr(req,"name",v,sizeof(v));if(!v[0]){out_error(out,outn,"INVALID_INPUT");return;}
+        safe_copy(me->name,NAME_LEN,v);save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"profile.change_username")) {
+        char v[USER_LEN];jstr(req,"username",v,sizeof(v));
+        if(strlen(v)<3){out_error(out,outn,"INVALID_USERNAME");return;}
+        if(username_exists(v,uid)){out_error(out,outn,"USERNAME_TAKEN");return;}
+        safe_copy(me->username,USER_LEN,v);save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"friends.list")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");
+        int first=1;
+        for(int i=0;i<nusers;i++)if(i!=user_index(uid)&&are_friends(uid,users[i].id)){
+            char u[512];public_user_json(u,sizeof(u),users[i].id);
+            p+=snprintf(d+p,sizeof(d)-p,"%s%s,\"online\":%s",first?"":",",u,(users[i].id%2)?"false":"true");first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+
+    if(!strcmp(action,"friends.remove")) {
+        int id=jint(req,"user_id",0);if(!user_ptr(id)){out_error(out,outn,"USER_NOT_FOUND");return;}
+        remove_friend(uid,id);save_db();out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"friends.request")) {
+        char sg[32];jstr(req,"sg_id",sg,sizeof(sg));int to=uid_by_sgid(sg);
+        if(!to||to==uid){out_error(out,outn,"USER_NOT_FOUND");return;}
+        if(is_blocked(uid,to)){out_error(out,outn,"ACCESS_DENIED");return;}
+        if(are_friends(uid,to)){out_error(out,outn,"ALREADY_EXISTS");return;}
+        for(int i=0;i<nrequests;i++)if((requests[i].from==uid&&requests[i].to==to)||(requests[i].from==to&&requests[i].to==uid)){out_error(out,outn,"ALREADY_EXISTS");return;}
+        if(nrequests>=MAX_REL){out_error(out,outn,"SERVER_FULL");return;}
+        requests[nrequests++] = (Request){next_id++,uid,to,0};
+        char tx[256];snprintf(tx,sizeof(tx),"%s sent you a friend request.",me->name);notify_user(to,tx,1);save_db();
+        out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"friends.requests")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"{\"received\":[");int first=1;
+        for(int i=0;i<nrequests;i++)if(requests[i].to==uid&&requests[i].status==0){
+            char u[512];public_user_json(u,sizeof(u),requests[i].from);
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":%d,\"user\":%s}",first?"":",",requests[i].id,u);first=0;
+        }
+        p+=snprintf(d+p,sizeof(d)-p,"],\"sent\":[");first=1;
+        for(int i=0;i<nrequests;i++)if(requests[i].from==uid&&requests[i].status==0){
+            char u[512];public_user_json(u,sizeof(u),requests[i].to);
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":%d,\"user\":%s}",first?"":",",requests[i].id,u);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]}");out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"friends.respond")) {
+        int rid=jint(req,"request_id",0),accept=jbool(req,"accept",0),found=-1;
+        for(int i=0;i<nrequests;i++)if(requests[i].id==rid&&requests[i].to==uid){found=i;break;}
+        if(found<0){out_error(out,outn,"NOT_FOUND");return;}
+        int from=requests[found].from;
+        if(accept)add_friend(uid,from);
+        requests[found]=requests[--nrequests];notify_user(from,accept?"Friend request accepted.":"Friend request rejected.",1);save_db();
+        out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"friends.cancel")) {
+        int rid=jint(req,"request_id",0);
+        for(int i=0;i<nrequests;i++)if(requests[i].id==rid&&requests[i].from==uid){requests[i]=requests[--nrequests];save_db();out_begin(out,outn,"{}");return;}
+        out_error(out,outn,"NOT_FOUND");return;
+    }
+
+    if(!strcmp(action,"blocks.list")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=0;i<nblocks;i++)if(blocks_rel[i].a==uid){
+            char u[512];public_user_json(u,sizeof(u),blocks_rel[i].b);
+            p+=snprintf(d+p,sizeof(d)-p,"%s%s",first?"":",",u);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+
+    if(!strcmp(action,"blocks.add")) {
+        int id=jint(req,"user_id",0);if(!user_ptr(id)||id==uid){out_error(out,outn,"USER_NOT_FOUND");return;}
+        if(!is_blocked(uid,id)&&nblocks<MAX_REL){blocks_rel[nblocks++]=(Pair){uid,id};remove_friend(uid,id);}
+        save_db();out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"blocks.remove")) {
+        int id=jint(req,"user_id",0);
+        for(int i=0;i<nblocks;i++)if(blocks_rel[i].a==uid&&blocks_rel[i].b==id){blocks_rel[i]=blocks_rel[--nblocks];break;}
+        save_db();out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"posts.list")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=nposts-1;i>=0;i--)if(post_visible(&posts[i],uid)){
+            Post *x=&posts[i];char au[512];public_user_json(au,sizeof(au),x->author);
+            char tx[TEXT_LEN*2];json_escape(x->text,tx,sizeof(tx));
+            int liked=0;for(int j=0;j<x->like_count;j++)if(x->likes[j]==uid)liked=1;
+            const char *vis=x->visibility==0?"public":x->visibility==1?"friends":"private";
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":%d,\"author\":%s,\"time\":%lld,\"visibility\":\"%s\",\"text\":\"%s\",\"likes\":%d,\"liked\":%s,\"comments\":%d,\"mine\":%s}",
+                first?"":",",x->id,au,(long long)x->t,vis,tx,x->like_count,liked?"true":"false",x->comment_count,x->author==uid?"true":"false");first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+
+    if(!strcmp(action,"posts.create")) {
+        char tx[TEXT_LEN],vis[32];jstr(req,"text",tx,sizeof(tx));jstr(req,"visibility",vis,sizeof(vis));
+        int v=!strcmp(vis,"public")?0:!strcmp(vis,"friends")?1:!strcmp(vis,"private")?2:-1;
+        if(!tx[0]||strlen(tx)>500||v<0){out_error(out,outn,"INVALID_INPUT");return;}
+        if(nposts>=MAX_POSTS){out_error(out,outn,"SERVER_FULL");return;}
+        Post *x=&posts[nposts++];memset(x,0,sizeof(*x));x->id=next_id++;x->author=uid;x->visibility=v;x->t=time(NULL);safe_copy(x->text,TEXT_LEN,tx);
+        log_event(uid,"Post created","info");save_db();out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"posts.delete")||!strcmp(action,"posts.like")||!strcmp(action,"posts.comment")) {
+        int pid=jint(req,"post_id",0),idx=-1;for(int i=0;i<nposts;i++)if(posts[i].id==pid){idx=i;break;}
+        if(idx<0||!post_visible(&posts[idx],uid)){out_error(out,outn,"NOT_FOUND");return;}
+        Post *x=&posts[idx];
+        if(!strcmp(action,"posts.delete")){
+            if(x->author!=uid){out_error(out,outn,"ACCESS_DENIED");return;}
+            posts[idx]=posts[--nposts];save_db();out_begin(out,outn,"{}");return;
+        }
+        if(!strcmp(action,"posts.like")){
+            int found=-1;for(int j=0;j<x->like_count;j++)if(x->likes[j]==uid){found=j;break;}
+            if(found>=0)x->likes[found]=x->likes[--x->like_count];
+            else if(x->like_count<MAX_USERS)x->likes[x->like_count++]=uid;
+            save_db();out_begin(out,outn,"{}");return;
+        }
+        char tx[TEXT_LEN];jstr(req,"text",tx,sizeof(tx));if(!tx[0]){out_error(out,outn,"INVALID_INPUT");return;}
+        if(ncomments>=MAX_REL){out_error(out,outn,"SERVER_FULL");return;}
+        int cid=next_id++;comments[ncomments]=(Comment){cid,uid,pid,time(NULL),""};safe_copy(comments[ncomments].text,TEXT_LEN,tx);ncomments++;
+        if(x->comment_count<MAX_REL)x->comment_ids[x->comment_count++]=cid;
+        save_db();out_begin(out,outn,"{}");return;
+    }
+
+    if(!strcmp(action,"messages.conversations")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=0;i<nusers;i++){int other=users[i].id;if(other==uid||!are_friends(uid,other))continue;
+            char au[512];public_user_json(au,sizeof(au),other);char last[TEXT_LEN]="";int unread=0;
+            time_t lt=0;for(int j=0;j<nmessages;j++)if((messages[j].from==uid&&messages[j].to==other)||(messages[j].from==other&&messages[j].to==uid)){
+                if(messages[j].t>=lt){lt=messages[j].t;safe_copy(last,sizeof(last),messages[j].text);}
+                if(messages[j].to==uid&&!messages[j].read)unread++;
+            }
+            char lx[TEXT_LEN*2];json_escape(last,lx,sizeof(lx));
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"user\":%s,\"last\":\"%s\",\"unread\":%d}",first?"":",",au,lx,unread);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"messages.get")) {
+        int other=jint(req,"user_id",0);if(!user_ptr(other)){out_error(out,outn,"USER_NOT_FOUND");return;}
+        int can=strcmp(me->messages,"nobody")!=0 && (!strcmp(me->messages,"everyone")||are_friends(uid,other));
+        if(is_blocked(uid,other))can=0;
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"{\"can_message\":%s,\"messages\":[",can?"true":"false");int first=1;
+        for(int i=0;i<nmessages;i++)if((messages[i].from==uid&&messages[i].to==other)||(messages[i].from==other&&messages[i].to==uid)){
+            if(messages[i].to==uid)messages[i].read=1;char tx[TEXT_LEN*2];json_escape(messages[i].text,tx,sizeof(tx));
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":%d,\"mine\":%s,\"text\":\"%s\",\"time\":%lld}",first?"":",",messages[i].id,messages[i].from==uid?"true":"false",tx,(long long)messages[i].t);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]}");save_db();out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"messages.send")) {
+        int other=jint(req,"user_id",0);char tx[TEXT_LEN];jstr(req,"text",tx,sizeof(tx));
+        if(!user_ptr(other)||!tx[0]){out_error(out,outn,"INVALID_INPUT");return;}
+        int can=strcmp(user_ptr(other)->messages,"nobody")!=0 && (!strcmp(user_ptr(other)->messages,"everyone")||are_friends(uid,other));
+        if(is_blocked(uid,other)||!can){out_error(out,outn,"ACCESS_DENIED");return;}
+        if(nmessages>=MAX_MSG){out_error(out,outn,"SERVER_FULL");return;}
+        Message *m=&messages[nmessages++];m->id=next_id++;m->from=uid;m->to=other;m->t=time(NULL);m->read=0;safe_copy(m->text,TEXT_LEN,tx);
+        notify_user(other,"You received a new message.",2);save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"messages.delete")) {
+        int mid=jint(req,"message_id",0);for(int i=0;i<nmessages;i++)if(messages[i].id==mid&&messages[i].from==uid){messages[i]=messages[--nmessages];save_db();out_begin(out,outn,"{}");return;}
+        out_error(out,outn,"NOT_FOUND");return;
+    }
+    if(!strcmp(action,"notifications.list")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=nnotes-1;i>=0;i--)if(notes[i].uid==uid){
+            char tx[TEXT_LEN*2];json_escape(notes[i].text,tx,sizeof(tx));
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":%d,\"type\":\"%d\",\"read\":%s,\"time\":%lld,\"text\":\"%s\"}",first?"":",",notes[i].id,notes[i].type,notes[i].read?"true":"false",(long long)notes[i].t,tx);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"notifications.read_all")) {
+        for(int i=0;i<nnotes;i++)if(notes[i].uid==uid)notes[i].read=1;save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"notifications.unread_count")) {
+        int c=0;for(int i=0;i<nnotes;i++)if(notes[i].uid==uid&&!notes[i].read)c++;
+        char d[64];snprintf(d,sizeof(d),"{\"count\":%d}",c);out_begin(out,outn,d);return;
+    }
+
+    if(!strcmp(action,"invites.list")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"{\"sent\":[");int first=1;
+        for(int i=0;i<ninvites;i++)if(invites[i].from==uid){
+            char u[512];public_user_json(u,sizeof(u),invites[i].to);
+            const char *st=invites[i].status==0?(time(NULL)>invites[i].expires?"expired":"pending"):invites[i].status==1?"accepted":invites[i].status==2?"rejected":"revoked";
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":\"%s\",\"user\":%s,\"status\":\"%s\",\"expires\":%lld,\"payload\":\"%s\"}",first?"":",",invites[i].id,u,st,(long long)invites[i].expires,invites[i].payload);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"],\"received\":[");first=1;
+        for(int i=0;i<ninvites;i++)if(invites[i].to==uid){
+            char u[512];public_user_json(u,sizeof(u),invites[i].from);
+            const char *st=invites[i].status==0?(time(NULL)>invites[i].expires?"expired":"pending"):invites[i].status==1?"accepted":invites[i].status==2?"rejected":"revoked";
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":\"%s\",\"user\":%s,\"status\":\"%s\",\"expires\":%lld,\"payload\":\"%s\"}",first?"":",",invites[i].id,u,st,(long long)invites[i].expires,invites[i].payload);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]}");out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"invites.create")) {
+        char sg[32];jstr(req,"receiver_sg_id",sg,sizeof(sg));int to=uid_by_sgid(sg);
+        if(!to||to==uid||is_blocked(uid,to)){out_error(out,outn,"ACCESS_DENIED");return;}
+        if(ninvites>=MAX_INVITE){out_error(out,outn,"SERVER_FULL");return;}
+        Invite *in=&invites[ninvites++];snprintf(in->id,sizeof(in->id),"INV-%06d",next_id++);in->from=uid;in->to=to;in->status=0;in->expires=time(NULL)+86400;
+        snprintf(in->payload,sizeof(in->payload),"SG_INVITE|%s|%s",me->sg_id,in->id);notify_user(to,"You received a private invitation.",3);save_db();
+        char d[512];snprintf(d,sizeof(d),"{\"id\":\"%s\",\"payload\":\"%s\",\"expires\":%lld}",in->id,in->payload,(long long)in->expires);out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"invites.respond")||!strcmp(action,"invites.revoke")) {
+        char iid[32];jstr(req,"invite_id",iid,sizeof(iid));int idx=-1;
+        for(int i=0;i<ninvites;i++)if(!strcmp(invites[i].id,iid)){idx=i;break;}
+        if(idx<0){out_error(out,outn,"NOT_FOUND");return;}
+        if(time(NULL)>invites[idx].expires&&invites[idx].status==0){out_error(out,outn,"EXPIRED");return;}
+        if(!strcmp(action,"invites.respond")){
+            if(invites[idx].to!=uid){out_error(out,outn,"ACCESS_DENIED");return;}
+            invites[idx].status=jbool(req,"accept",0)?1:2;if(invites[idx].status==1)add_friend(invites[idx].from,invites[idx].to);
+        }else{
+            if(invites[idx].from!=uid){out_error(out,outn,"ACCESS_DENIED");return;}invites[idx].status=3;
+        }save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"privacy.get")) {
+        char d[512];snprintf(d,sizeof(d),"{\"visibility\":\"%s\",\"profile_view\":\"%s\",\"friend_requests\":\"%s\",\"messages\":\"%s\"}",
+            me->visibility,me->profile_view,me->friend_requests,me->messages);out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"privacy.set")) {
+        char v[32];
+        if(jstr(req,"visibility",v,sizeof(v))) {if(strcmp(v,"public")&&strcmp(v,"private")){out_error(out,outn,"INVALID_INPUT");return;}safe_copy(me->visibility,sizeof(me->visibility),v);}
+        if(jstr(req,"profile_view",v,sizeof(v))) {if(strcmp(v,"everyone")&&strcmp(v,"friends")&&strcmp(v,"nobody")){out_error(out,outn,"INVALID_INPUT");return;}safe_copy(me->profile_view,sizeof(me->profile_view),v);}
+        if(jstr(req,"friend_requests",v,sizeof(v))) {if(strcmp(v,"everyone")&&strcmp(v,"friends_of_friends")&&strcmp(v,"nobody")){out_error(out,outn,"INVALID_INPUT");return;}safe_copy(me->friend_requests,sizeof(me->friend_requests),v);}
+        if(jstr(req,"messages",v,sizeof(v))) {if(strcmp(v,"everyone")&&strcmp(v,"friends")&&strcmp(v,"nobody")){out_error(out,outn,"INVALID_INPUT");return;}safe_copy(me->messages,sizeof(me->messages),v);}
+        log_event(uid,"Privacy setting updated","security");save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"security.activity")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=nlogs-1;i>=0;i--)if(logs[i].uid==uid){
+            char tx[TEXT_LEN*2];json_escape(logs[i].text,tx,sizeof(tx));
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"time\":%lld,\"text\":\"%s\",\"level\":\"%s\"}",first?"":",",(long long)logs[i].t,tx,logs[i].level);first=0;
+        }p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"security.overview")) {
+        int blocked=0;for(int i=0;i<nblocks;i++)if(i<nblocks&&blocks_rel[i].a==uid)blocked++;
+        long long last=0;for(int i=0;i<nlogs;i++)if(logs[i].uid==uid&&!strcmp(logs[i].text,"Successful login")&&(long long)logs[i].t>last)last=logs[i].t;
+        char status[32]; safe_copy(status,sizeof(status),me->lock_until>time(NULL)?"Temporarily Locked":"Protected");
+        char d[1024];snprintf(d,sizeof(d),"{\"account_status\":\"%s\",\"privacy\":\"%s\",\"password\":\"Strong\",\"last_login\":%lld,\"failed_logins\":%d,\"blocked\":%d,\"events\":[]}",
+            status,!strcmp(me->visibility,"public")?"Public":"Private",last,me->failed,blocked);out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"reports.submit")) {
+        char tt[16],tid[64],reason[128],desc[TEXT_LEN];jstr(req,"target_type",tt,sizeof(tt));jstr(req,"target_id",tid,sizeof(tid));jstr(req,"reason",reason,sizeof(reason));jstr(req,"description",desc,sizeof(desc));
+        if(!tt[0]||!tid[0]||!reason[0]){out_error(out,outn,"INVALID_INPUT");return;}
+        if(nreports>=MAX_REPORT){out_error(out,outn,"SERVER_FULL");return;}
+        Report *r=&reports[nreports++];snprintf(r->id,sizeof(r->id),"REP-%05d",next_id++);r->reporter=uid;safe_copy(r->target_type,sizeof(r->target_type),tt);safe_copy(r->target_id,sizeof(r->target_id),tid);safe_copy(r->reason,sizeof(r->reason),reason);safe_copy(r->description,sizeof(r->description),desc);safe_copy(r->status,sizeof(r->status),"open");r->t=time(NULL);
+        log_event(uid,"Report submitted","info");save_db();char d[128];snprintf(d,sizeof(d),"{\"id\":\"%s\"}",r->id);out_begin(out,outn,d);return;
+    }
+    if(!strncmp(action,"admin.",6) && strcmp(me->role,"admin")){out_error(out,outn,"ACCESS_DENIED");return;}
+    if(!strcmp(action,"admin.stats")) {
+        int open=0,active=0,disabled=0,sec=0;for(int i=0;i<nreports;i++)if(strcmp(reports[i].status,"closed"))open++;
+        for(int i=0;i<nusers;i++)if(users[i].enabled)active++;else disabled++;
+        for(int i=0;i<nlogs;i++)if(!strcmp(logs[i].level,"security")||!strcmp(logs[i].level,"warning"))sec++;
+        char d[256];snprintf(d,sizeof(d),"{\"reports\":%d,\"active_users\":%d,\"disabled\":%d,\"security_events\":%d}",open,active,disabled,sec);out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"admin.users")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=0;i<nusers;i++){char nm[160],un[80];json_escape(users[i].name,nm,sizeof(nm));json_escape(users[i].username,un,sizeof(un));
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":%d,\"name\":\"%s\",\"username\":\"%s\",\"role\":\"%s\",\"enabled\":%s}",first?"":",",users[i].id,nm,un,users[i].role,users[i].enabled?"true":"false");first=0;}
+        p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+
+    if(!strcmp(action,"admin.reports")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=nreports-1;i>=0;i--){Report *r=&reports[i];char a[256],b[128],c[256],e[TEXT_LEN*2];json_escape(r->reason,a,sizeof(a));json_escape(r->target_id,b,sizeof(b));json_escape(r->description,e,sizeof(e));json_escape(r->target_type,c,sizeof(c));
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"id\":\"%s\",\"reporter\":\"%s\",\"target_type\":\"%s\",\"target_id\":\"%s\",\"reason\":\"%s\",\"description\":\"%s\",\"status\":\"%s\",\"time\":%lld}",first?"":",",r->id,user_ptr(r->reporter)?user_ptr(r->reporter)->username:"unknown",c,b,a,e,r->status,(long long)r->t);first=0;}
+        p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+    if(!strcmp(action,"admin.report_status")) {
+        char rid[32],st[24];jstr(req,"report_id",rid,sizeof(rid));jstr(req,"status",st,sizeof(st));
+        for(int i=0;i<nreports;i++)if(!strcmp(reports[i].id,rid)&&( !strcmp(st,"reviewing")||!strcmp(st,"closed"))){safe_copy(reports[i].status,sizeof(reports[i].status),st);save_db();out_begin(out,outn,"{}");return;}
+        out_error(out,outn,"NOT_FOUND");return;
+    }
+
+    if(!strcmp(action,"admin.set_enabled")) {
+        int id=jint(req,"user_id",0),en=jbool(req,"enabled",0);User *u=user_ptr(id);
+        if(!u||u->id==uid){out_error(out,outn,"ACCESS_DENIED");return;}
+        u->enabled=en;log_event(uid,en?"Account re-enabled":"Account disabled","security");save_db();out_begin(out,outn,"{}");return;
+    }
+    if(!strcmp(action,"admin.logs")) {
+        char d[RESP_LEN];size_t p=0;p+=snprintf(d+p,sizeof(d)-p,"[");int first=1;
+        for(int i=nlogs-1;i>=0&&i>nlogs-81;i--){char tx[TEXT_LEN*2];json_escape(logs[i].text,tx,sizeof(tx));User *u=user_ptr(logs[i].uid);
+            p+=snprintf(d+p,sizeof(d)-p,"%s{\"time\":%lld,\"text\":\"@%s: %s\",\"level\":\"%s\"}",first?"":",",(long long)logs[i].t,u?u->username:"unknown",tx,logs[i].level);first=0;}
+        p+=snprintf(d+p,sizeof(d)-p,"]");out_begin(out,outn,d);return;
+    }
+    out_error(out,outn,"NOT_FOUND");
+}
+
+
+static int send_line(socket_t c,const char *s) {
+    size_t len=strlen(s);char *x=(char*)malloc(len+2);if(!x)return 0;
+    memcpy(x,s,len);x[len]='\n';x[len+1]=0;
+    size_t sent=0;while(sent<len+1){int n=send(c,x+sent,(int)(len+1-sent),0);if(n<=0){free(x);return 0;}sent+=(size_t)n;}
+    free(x);return 1;
+}
+static void handle_client(socket_t c) {
+    char req[REQ_LEN],resp[RESP_LEN];size_t used=0;
+    while(used<sizeof(req)-1){
+        char ch;int n=recv(c,&ch,1,0);if(n<=0)break;
+        if(ch=='\n')break;req[used++]=ch;
+    }
+    req[used]='\0';
+    if(used){dispatch(req,resp,sizeof(resp));send_line(c,resp);}
+}
+
+int main(void) {
+#ifdef _WIN32
+    WSADATA w; if(WSAStartup(MAKEWORD(2,2),&w)!=0){fprintf(stderr,"WSAStartup failed\n");return 1;}
+#endif
+    seed();
+
+    socket_t server=socket(AF_INET,SOCK_STREAM,0);
+    if(server==INVALID_SOCKET){fprintf(stderr,"socket() failed\n");return 1;}
+
+    int opt=1;
+#ifdef _WIN32
+    setsockopt(server,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+#else
+    setsockopt(server,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+#endif
+    struct sockaddr_in addr;memset(&addr,0,sizeof(addr));
+    addr.sin_family=AF_INET;addr.sin_addr.s_addr=inet_addr("127.0.0.1");addr.sin_port=htons(PORT);
+
+    if(bind(server,(struct sockaddr*)&addr,sizeof(addr))==SOCKET_ERROR){
+        fprintf(stderr,"Could not bind 127.0.0.1:%d\n",PORT);CLOSESOCK(server);return 1;
+    }
+    if(listen(server,16)==SOCKET_ERROR){
+        fprintf(stderr,"listen() failed\n");CLOSESOCK(server);return 1;
+    }
+    printf("====================================\n");
+    printf("       SOCIAL GLITCH BACKEND\n");
+    printf("====================================\n");
+    printf("Host: 127.0.0.1\nPort: %d\n\n",PORT);
+    printf("Demo user : demo / Demo@1234\n");
+    printf("Admin     : admin / Admin@1234\n\n");
+    printf("Persistent database: %s\n",DB_FILE);
+    printf("Waiting for Python frontend...\n");
+
+    while(1){
+        struct sockaddr_in client;
+#ifdef _WIN32
+        int clen=sizeof(client);
+#else
+        socklen_t clen=sizeof(client);
+#endif
+        socket_t c=accept(server,(struct sockaddr*)&client,&clen);
+        if(c==INVALID_SOCKET)continue;
+        handle_client(c);CLOSESOCK(c);
+    }
+    CLOSESOCK(server);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
+}
